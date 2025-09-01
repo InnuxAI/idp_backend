@@ -1,33 +1,55 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 import base64
 import os
-from typing import List, Optional
+from typing import List, Optional, Iterator
 import asyncio
-from google import genai
-from google.genai import types
-from sentence_transformers import SentenceTransformer
-import chromadb
-from chromadb.config import Settings
+import json
 import uuid
 import io
-import PyPDF2
-from docx import Document
 import hashlib
+import traceback
 from dotenv import load_dotenv
+import uvicorn
+
+# New pipeline imports
+import pymupdf as fitz  # PyMuPDF
+from PIL import Image
+import qdrant_client
+from llama_index.vector_stores.qdrant import QdrantVectorStore
+from llama_index.core import StorageContext, Settings, SimpleDirectoryReader
+from llama_index.core.indices import MultiModalVectorStoreIndex
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from llama_index.core.query_engine import CustomQueryEngine
+from llama_index.core.retrievers import BaseRetriever
+from llama_index.core.schema import ImageNode, NodeWithScore, MetadataMode, TextNode
+from llama_index.core.prompts import PromptTemplate
+from llama_index.core.base.response.schema import Response
+
+# Original imports for agent functionality
+from google import genai
+from google.genai import types
+from agno.agent import Agent, RunResponseEvent
+from agno.models.google import Gemini
+from tools.pdfConversionTools import PdfConversionTools 
+from agno.playground import Playground, serve_playground_app
+from agno.storage.sqlite import SqliteStorage
 
 load_dotenv("../../.env")
 
 # Create uploads directory if it doesn't exist
 UPLOADS_DIR = "./uploads"
+ARTIFACTS_DIR = "./artifacts"
 os.makedirs(UPLOADS_DIR, exist_ok=True)
+os.makedirs(ARTIFACTS_DIR, exist_ok=True)
 
-app = FastAPI(title="Invoice Document Processing API")
+app = FastAPI(title="Multimodal Document Processing API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],         # In production, specify frontend domain(s) here for best security.
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -40,454 +62,825 @@ except Exception as e:
     print(f"Warning: Gemini client initialization failed: {e}")
     client = None
 
-# Initialize SentenceTransformer model for embeddings
-try:
-    embedder = SentenceTransformer('all-MiniLM-L6-v2')
-except Exception as e:
-    print(f"Warning: SentenceTransformer initialization failed: {e}")
-    embedder = None
+# Initialize embedding models for multimodal pipeline
+embed_model_text = None
+embed_model_image = None
+storage_context = None
 
-# Initialize ChromaDB client (persistent storage)
-try:
-    chroma_client = chromadb.PersistentClient(path="./chroma_db")
-    collection_name = "invoice_documents"
+def restore_global_index():
+    """Restore global index from existing Qdrant collections"""
+    global global_index
     
-    # Create or get collection with custom embedding function
     try:
-        collection = chroma_client.get_collection(collection_name)
-    except:
-        collection = chroma_client.create_collection(
-            name=collection_name,
-            metadata={"hnsw:space": "cosine"}
-        )
-except Exception as e:
-    print(f"Warning: ChromaDB initialization failed: {e}")
-    collection = None
-
-class DocumentProcessor:
-    def __init__(self):
-        self.gemini_client = client
-        self.embedder = embedder
-        
-    async def extract_text_from_pdf_gemini(self, file_bytes: bytes, filename: str) -> dict:
-        """Extract information from PDF using Gemini LLM"""
-        try:
-            model = "gemini-2.0-flash"
-            contents = [
-                types.Content(
-                    role="user",
-                    parts=[
-                        types.Part.from_bytes(
-                            mime_type="application/pdf", 
-                            data=file_bytes
-                        ),
-                        types.Part.from_text(
-                            text="""Extract all relevant information from this invoice/document. 
-                            Please provide a structured summary including:
-                            - Document type
-                            - Invoice number (if applicable)
-                            - Date
-                            - Vendor/Company information
-                            - Customer information
-                            - Items/services listed
-                            - Amounts and totals
-                            - Any other relevant details
-                            
-                            Format the response in a clear, structured way."""
-                        ),
-                    ],
-                )
-            ]
+        if not storage_context:
+            print("❌ Storage context not available for index restoration")
+            return False
             
-            result_text = ""
-            generate_content_config = types.GenerateContentConfig()
+        if global_index is not None:
+            print("✅ Global index already exists")
+            return True
             
-            for chunk in self.gemini_client.models.generate_content_stream(
-                model=model, 
-                contents=contents, 
-                config=generate_content_config
-            ):
-                result_text += chunk.text
+        # Check if collections have data
+        print("🔍 Checking Qdrant collections...")
+        client_instance = storage_context.vector_store._client
+        collections = client_instance.get_collections()
+        print(f"Found {len(collections.collections)} collections: {[col.name for col in collections.collections]}")
+        
+        text_collection_exists = any(col.name == "text_collection" for col in collections.collections)
+        image_collection_exists = any(col.name == "image_collection" for col in collections.collections)
+        
+        print(f"Text collection exists: {text_collection_exists}")
+        print(f"Image collection exists: {image_collection_exists}")
+        
+        if not (text_collection_exists and image_collection_exists):
+            print("❌ Required collections don't exist")
+            return False
             
-            return {
-                "success": True,
-                "extracted_text": result_text,
-                "method": "gemini_llm"
-            }
-        except Exception as e:
-            # Fallback to basic PDF extraction
-            return await self.extract_text_from_pdf_fallback(file_bytes)
-    
-    async def extract_text_from_pdf_fallback(self, file_bytes: bytes) -> dict:
-        """Fallback PDF text extraction using PyPDF2"""
-        try:
-            pdf_file = io.BytesIO(file_bytes)
-            pdf_reader = PyPDF2.PdfReader(pdf_file)
-            text = ""
+        # Check if collections have data
+        text_info = client_instance.get_collection("text_collection")
+        image_info = client_instance.get_collection("image_collection")
+        
+        print(f"Text collection points: {text_info.points_count}")
+        print(f"Image collection points: {image_info.points_count}")
+        
+        if text_info.points_count == 0 and image_info.points_count == 0:
+            print("❌ Collections exist but have no data")
+            return False
             
-            for page in pdf_reader.pages:
-                text += page.extract_text() + "\n"
-            
-            return {
-                "success": True,
-                "extracted_text": text,
-                "method": "pypdf2_fallback"
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "method": "fallback_failed"
-            }
-    
-    async def extract_text_from_docx(self, file_bytes: bytes) -> dict:
-        """Extract text from Word document"""
-        try:
-            doc_file = io.BytesIO(file_bytes)
-            doc = Document(doc_file)
-            text = ""
-            
-            for paragraph in doc.paragraphs:
-                text += paragraph.text + "\n"
-            
-            # Extract tables if any
-            for table in doc.tables:
-                for row in table.rows:
-                    for cell in row.cells:
-                        text += cell.text + " "
-                    text += "\n"
-            
-            return {
-                "success": True,
-                "extracted_text": text,
-                "method": "python_docx"
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "method": "docx_failed"
-            }
-    
-    def generate_embedding(self, text: str) -> List[float]:
-        """Generate embedding for text using sentence-transformers"""
-        try:
-            return self.embedder.encode(text).tolist()
-        except Exception as e:
-            # Return zero vector as fallback
-            return [0.0] * 384  # all-MiniLM-L6-v2 has 384 dimensions
-
-processor = DocumentProcessor()
-
-@app.get("/")
-async def root():
-    return {"message": "Invoice Document Processing API", "status": "running"}
-
-@app.get("/health")
-async def health_check():
-    return {
-        "gemini_available": client is not None,
-        "embedder_available": embedder is not None,
-        "chromadb_available": collection is not None
-    }
-
-@app.post("/upload-document/")
-async def upload_document(file: UploadFile = File(...)):
-    """Upload and process invoice/document"""
-    try:
-        if not collection:
-            raise HTTPException(status_code=500, detail="ChromaDB not available")
+        print(f"📊 Found existing data: {text_info.points_count} text points, {image_info.points_count} image points")
         
-        # Read file content
-        file_bytes = await file.read()
-        file_hash = hashlib.md5(file_bytes).hexdigest()
-        doc_id = f"{file.filename}_{file_hash[:8]}"
+        # Create index from existing vector stores
+        print("🔄 Restoring global index from existing Qdrant data...")
         
-        # Save the original file
-        file_path = os.path.join(UPLOADS_DIR, f"{doc_id}_{file.filename}")
-        with open(file_path, "wb") as f:
-            f.write(file_bytes)
-        
-        # Check if document already exists
-        try:
-            existing = collection.get(ids=[doc_id])
-            if existing['ids']:
-                return {
-                    "message": "Document already exists",
-                    "doc_id": doc_id,
-                    "status": "duplicate"
-                }
-        except:
-            pass
-        
-        # Extract text based on file type
-        extraction_result = None
-        
-        if file.content_type == "application/pdf":
-            extraction_result = await processor.extract_text_from_pdf_gemini(
-                file_bytes, file.filename
-            )
-        elif file.content_type in [
-            "application/msword", 
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        ]:
-            extraction_result = await processor.extract_text_from_docx(file_bytes)
-        else:
-            raise HTTPException(
-                status_code=415, 
-                detail=f"Unsupported file type: {file.content_type}"
-            )
-        
-        if not extraction_result["success"]:
-            raise HTTPException(
-                status_code=500, 
-                detail=f"Text extraction failed: {extraction_result.get('error', 'Unknown error')}"
-            )
-        
-        extracted_text = extraction_result["extracted_text"]
-        
-        # Generate embedding
-        embedding = processor.generate_embedding(extracted_text)
-        
-        # Store in vector database
-        collection.add(
-            documents=[extracted_text],
-            metadatas=[{
-                "filename": file.filename,
-                "content_type": file.content_type,
-                "extraction_method": extraction_result["method"],
-                "file_size": len(file_bytes),
-                "file_path": file_path
-            }],
-            ids=[doc_id],
-            embeddings=[embedding]
+        # Create a simple index that connects to existing vector stores
+        global_index = MultiModalVectorStoreIndex(
+            [],  # No documents needed since we're connecting to existing data
+            storage_context=storage_context,
         )
         
-        return {
-            "message": "Document uploaded and processed successfully",
-            "doc_id": doc_id,
-            "extraction_method": extraction_result["method"],
-            "text_length": len(extracted_text),
-            "status": "success"
-        }
+        print("✅ Global index restored successfully")
+        return True
         
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"❌ Failed to restore global index: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+def initialize_embeddings():
+    """Initialize embedding models lazily when needed"""
+    global embed_model_text, embed_model_image, storage_context
     
+    if embed_model_text is None:
+        try:
+            print("Initializing text embedding model...")
+            embed_model_text = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
+            print("✅ Text embedding model loaded")
+        except Exception as e:
+            print(f"Warning: Text embedding model initialization failed: {e}")
+            return False
+            
+    if embed_model_image is None:
+        try:
+            print("Initializing image embedding model...")
+            embed_model_image = HuggingFaceEmbedding(model_name="sentence-transformers/clip-ViT-B-32")
+            Settings.chunk_size = 512
+            Settings.embed_model = embed_model_image
+            print("✅ Image embedding model loaded")
+        except Exception as e:
+            print(f"Warning: Image embedding model initialization failed: {e}")
+            return False
+    
+    # Initialize Qdrant client after embeddings are ready
+    if storage_context is None:
+        try:
+            print("Initializing Qdrant vector stores...")
+            qdrant_client_instance = qdrant_client.QdrantClient(path="./qdrant_db")
+            
+            # Ensure collections exist with proper configuration
+            from qdrant_client.models import Distance, VectorParams
+            
+            # Create text collection if it doesn't exist
+            try:
+                qdrant_client_instance.get_collection("text_collection")
+                print("✅ Text collection already exists")
+            except Exception:
+                print("Creating text collection...")
+                qdrant_client_instance.create_collection(
+                    collection_name="text_collection",
+                    vectors_config=VectorParams(size=384, distance=Distance.COSINE)  # BGE model dimension
+                )
+                print("✅ Text collection created")
+            
+            # Create image collection if it doesn't exist  
+            try:
+                qdrant_client_instance.get_collection("image_collection")
+                print("✅ Image collection already exists")
+            except Exception:
+                print("Creating image collection...")
+                qdrant_client_instance.create_collection(
+                    collection_name="image_collection", 
+                    vectors_config=VectorParams(size=512, distance=Distance.COSINE)  # CLIP model dimension
+                )
+                print("✅ Image collection created")
+            
+            # Create text vector store
+            text_store = QdrantVectorStore(
+                client=qdrant_client_instance,
+                collection_name="text_collection",
+            )
+            
+            # Create image vector store  
+            image_store = QdrantVectorStore(
+                client=qdrant_client_instance,
+                collection_name="image_collection",
+            )
+            
+            # Set global embedding models for LlamaIndex
+            Settings.embed_model = embed_model_text  # Default to text embeddings
+            
+            storage_context = StorageContext.from_defaults(
+                vector_store=text_store,
+                image_store=image_store,
+            )
+            print("✅ Storage context initialized")
+            
+            # Try to restore global index from existing data
+            restore_global_index()
+            
+            return True
+        except Exception as e:
+            print(f"Warning: Storage context initialization failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    else:
+        # Storage context already exists, try to restore global index
+        restore_global_index()
+    
+    return True
 
-
-# @app.post("/query-documents/")
-# async def query_documents(
-#     query: str, 
-#     top_k: int = 3,
-#     use_llm_for_answer: bool = True
-# ):
-#     """Query documents and get relevant answers"""
-#     try:
-#         if not collection:
-#             raise HTTPException(status_code=500, detail="ChromaDB not available")
-        
-#         # Generate embedding for query
-#         query_embedding = processor.generate_embedding(query)
-        
-#         # Query vector database
-#         results = collection.query(
-#             query_embeddings=[query_embedding],
-#             n_results=top_k,
-#             include=['documents']  # Only include documents to avoid metadata issues
-#         )
-        
-#         if not results['documents'] or not results['documents'][0]:
-#             return {
-#                 "query": query,
-#                 "answer": "No relevant documents found.",
-#                 "sources": [],
-#                 "method": "no_results"
-#             }
-        
-#         # Extract documents
-#         documents = results['documents'][0]
-        
-#         # If Gemini is available and requested, use it to generate a comprehensive answer
-#         if use_llm_for_answer and client:
-#             try:
-#                 context = "\n\n".join(documents[:2])  # Use top 2 most relevant docs
-                
-#                 model = "gemini-2.0-flash"
-#                 contents = [
-#                     types.Content(
-#                         role="user",
-#                         parts=[
-#                             types.Part.from_text(
-#                                 text=f"""Based on the following document excerpts, please answer this question: "{query}"
-                                
-#                                 Document excerpts:
-#                                 {context}
-                                
-#                                 Please provide a clear, accurate answer based only on the information provided in the documents. 
-#                                 If the information is not sufficient to answer the question, please say so."""
-#                             ),
-#                         ],
-#                     )
-#                 ]
-                
-#                 llm_answer = ""
-#                 generate_content_config = types.GenerateContentConfig()
-                
-#                 for chunk in client.models.generate_content_stream(
-#                     model=model, 
-#                     contents=contents, 
-#                     config=generate_content_config
-#                 ):
-#                     llm_answer += chunk.text
-                
-#                 return {
-#                     "query": query,
-#                     "answer": llm_answer,
-#                     "sources": [
-#                         {
-#                             "document_index": i + 1,
-#                             "content_preview": doc[:300] + "..." if len(doc) > 300 else doc
-#                         }
-#                         for i, doc in enumerate(documents)
-#                     ],
-#                     "method": "llm_generated"
-#                 }
-                
-#             except Exception as e:
-#                 print(f"LLM generation failed: {e}")
-#                 pass
-        
-#         # Fallback: return relevant document excerpts
-#         return {
-#             "query": query,
-#             "answer": "Here are the most relevant document excerpts:",
-#             "sources": [
-#                 {
-#                     "document_index": i + 1,
-#                     "content": doc[:500] + "..." if len(doc) > 500 else doc
-#                 }
-#                 for i, doc in enumerate(documents)
-#             ],
-#             "method": "document_retrieval"
-#         }
-        
-#     except HTTPException:
-#         raise
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
-from pydantic import BaseModel
-from typing import Optional
-
+# Pydantic models
 class QueryRequest(BaseModel):
     query: str
     filename: Optional[str] = None
     top_k: Optional[int] = 3
     use_llm_for_answer: Optional[bool] = True
 
-# Replace your current endpoint with this:
-@app.post("/query-documents/")
-async def query_documents(request: QueryRequest):
-    """Query documents and get relevant answers"""
-    try:
-        if not collection:
-            raise HTTPException(status_code=500, detail="ChromaDB not available")
-        
-        # Generate embedding for query
-        query_embedding = processor.generate_embedding(request.query)
-        
-        # Query vector database
+class StreamQueryRequest(BaseModel):
+    query: str
+    filename: Optional[str] = None
+    top_k: Optional[int] = 3
 
-        results = None
-        if request.filename:
-            results = collection.query(
-                query_embeddings=[query_embedding],
-                n_results=request.top_k,
-                include=['documents'],
-                where={"filename": request.filename}
-            )
-        else:
-            results = collection.query(
-                query_embeddings=[query_embedding],
-                n_results=request.top_k,
-                include=['documents']
-            )
+class Structure(BaseModel):
+    text_response: str = Field(description="Text response from the LLM")
+    file_name_used: List[str] = Field(description="List of image file names used", default=[])
+
+# Utility functions for new pipeline
+def make_filename(base_name, page, suffix, ext="jpg"):
+    """Create deterministic filename for extracted images"""
+    return f"{os.path.splitext(base_name)[0]}_p{page}_{suffix}.{ext}"
+
+def extract_images(pdf_path, method="both", dpi=200):
+    """
+    Extract images from PDF.
+    method = "embedded" | "fullpage" | "both"
+    Saves images into /artifacts/embedded and /artifacts/fullpage
+    """
+    pdf_document = fitz.open(pdf_path)
+    file_name = os.path.basename(pdf_path)
+    
+    # Create subdirectories for this specific document
+    doc_name = os.path.splitext(file_name)[0]
+    doc_artifacts_dir = os.path.join(ARTIFACTS_DIR, doc_name)
+    embedded_dir = os.path.join(doc_artifacts_dir, "embedded")
+    fullpage_dir = os.path.join(doc_artifacts_dir, "fullpage")
+    
+    if method in ["embedded", "both"]:
+        os.makedirs(embedded_dir, exist_ok=True)
+    if method in ["fullpage", "both"]:
+        os.makedirs(fullpage_dir, exist_ok=True)
+    
+    extracted_files = []
+    
+    for page_num, page in enumerate(pdf_document):
+        page_number = page_num + 1
         
-        if not results['documents'] or not results['documents'][0]:
-            return {
-                "query": request.query,
-                "answer": "No relevant documents found.",
-                "sources": [],
-                "method": "no_results"
-            }
+        # --- Embedded images ---
+        if method in ["embedded", "both"]:
+            for img_index, img in enumerate(page.get_images(full=True)):
+                xref = img[0]
+                base_image = pdf_document.extract_image(xref)
+                image_bytes = base_image["image"]
+                image_ext = base_image["ext"]
+                filename = make_filename(file_name, page_number, f"emb{img_index+1}", image_ext)
+                filepath = os.path.join(embedded_dir, filename)
+                
+                with open(filepath, "wb") as f:
+                    f.write(image_bytes)
+                extracted_files.append(filepath)
         
-        # Extract documents
-        documents = results['documents'][0]
+        # --- Full page render ---
+        if method in ["fullpage", "both"]:
+            zoom = dpi / 72
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat)
+            img_bytes = pix.tobytes("png")
+            img = Image.open(io.BytesIO(img_bytes))
+            filename = make_filename(file_name, page_number, "page", "jpg")
+            page_img_path = os.path.join(fullpage_dir, filename)
+            img.convert("RGB").save(page_img_path, "JPEG", quality=90)
+            extracted_files.append(page_img_path)
+    
+    pdf_document.close()
+    return extracted_files, doc_artifacts_dir
+
+# Query engine for multimodal RAG
+QA_PROMPT_TMPL = """Below we give parsed text and images as context.
+Use both the parsed text and images to answer the question.
+Write your response in markdown format.
+Note: Don't Put Images Used: in the text_response
+
+---------------------
+{context_str}
+---------------------
+
+Given the context information and not prior knowledge, answer the query. Explain your reasoning based on the text or image, and if there are discrepancies, mention your reasoning for the answer.
+
+Query: {query_str}
+Answer: """
+
+QA_PROMPT = PromptTemplate(QA_PROMPT_TMPL)
+
+class MultimodalGeminiEngine(CustomQueryEngine):
+    """Multimodal query engine with robust image processing and error handling"""
+    
+    qa_prompt: PromptTemplate
+    retriever: BaseRetriever
+    
+    def __init__(self, qa_prompt: Optional[PromptTemplate] = None, **kwargs) -> None:
+        """Initialize."""
+        super().__init__(qa_prompt=qa_prompt or QA_PROMPT, **kwargs)
+    
+    def _get_image_mime_type(self, image_path: str) -> str:
+        """Determine MIME type from file extension."""
+        extension = image_path.lower().split('.')[-1]
+        mime_types = {
+            'jpg': 'image/jpeg',
+            'jpeg': 'image/jpeg', 
+            'png': 'image/png',
+            'gif': 'image/gif',
+            'webp': 'image/webp',
+            'bmp': 'image/bmp'
+        }
+        return mime_types.get(extension, 'image/jpeg')
+    
+    def _process_image_node(self, image_node: ImageNode) -> Optional[types.Part]:
+        """Process a single image node into a GenAI Part."""
+        methods = [
+            self._try_base64_image,
+            self._try_resolve_image,
+            self._try_file_path,
+            self._try_image_url
+        ]
         
-        # If Gemini is available and requested, use it to generate a comprehensive answer
-        if request.use_llm_for_answer and client:
+        for method in methods:
             try:
-                context = "\n\n".join(documents[:2])  # Use top 2 most relevant docs
-                
-                model = "gemini-2.0-flash"
-                contents = [
-                    types.Content(
-                        role="user",
-                        parts=[
-                            types.Part.from_text(
-                                text=f"""Based on the following document excerpts, please answer this question: "{request.query}"
-                                
-                                Document excerpts:
-                                {context}
-                                
-                                Please provide a clear, accurate answer based only on the information provided in the documents. 
-                                If the information is not sufficient to answer the question, please say so."""
-                            ),
-                        ],
-                    )
-                ]
-                
-                llm_answer = ""
-                generate_content_config = types.GenerateContentConfig()
-                
-                for chunk in client.models.generate_content_stream(
-                    model=model, 
-                    contents=contents, 
-                    config=generate_content_config
-                ):
-                    llm_answer += chunk.text
-                
-                return {
-                    "query": request.query,
-                    "answer": llm_answer,
-                    "sources": [
-                        {
-                            "document_index": i + 1,
-                            "content_preview": doc[:300] + "..." if len(doc) > 300 else doc
-                        }
-                        for i, doc in enumerate(documents)
-                    ],
-                    "method": "llm_generated"
+                part = method(image_node)
+                if part is not None:
+                    return part
+            except Exception as e:
+                continue
+        
+        print(f"Warning: Could not process ImageNode {image_node.id_}")
+        return None
+    
+    def _try_base64_image(self, image_node: ImageNode) -> Optional[types.Part]:
+        """Try to get image from base64 encoded data."""
+        try:
+            if hasattr(image_node, 'image') and image_node.image:
+                image_bytes = base64.b64decode(image_node.image)
+                return types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
+            return None
+        except Exception as e:
+            return None
+    
+    def _try_resolve_image(self, image_node: ImageNode) -> Optional[types.Part]:
+        """Try to get image using resolve_image method."""
+        if hasattr(image_node, 'resolve_image'):
+            image_buffer = image_node.resolve_image()
+            image_bytes = image_buffer.getvalue()
+            return types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
+        return None
+    
+    def _try_file_path(self, image_node: ImageNode) -> Optional[types.Part]:
+        """Try to get image from file path."""
+        if hasattr(image_node, 'image_path') and image_node.image_path:
+            with open(image_node.image_path, 'rb') as f:
+                image_bytes = f.read()
+            mime_type = self._get_image_mime_type(image_node.image_path)
+            return types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
+        return None
+    
+    def _try_image_url(self, image_node: ImageNode) -> Optional[types.Part]:
+        """Try to get image from URL."""
+        if hasattr(image_node, 'image_url') and image_node.image_url:
+            return types.Part.from_uri(
+                file_uri=image_node.image_url,
+                mime_type="image/jpeg"
+            )
+        return None
+    
+    def custom_query(self, query_str: str):
+        """Execute the query with robust image processing - exact implementation from PDF."""
+        # Retrieve nodes
+        nodes = self.retriever.retrieve(query_str)
+        img_nodes = [n for n in nodes if isinstance(n.node, ImageNode)]
+        text_nodes = [n for n in nodes if isinstance(n.node, TextNode)]
+        
+        print(f"Image Node : {len(img_nodes)}")
+        print(f"Text Node : {len(text_nodes)}")
+        # Create context string
+        context_str = "\n\n".join(
+            [r.get_content(metadata_mode=MetadataMode.LLM) for r in nodes]
+        )
+        fmt_prompt = self.qa_prompt.format(context_str=context_str, query_str=query_str)
+        
+        # Prepare content parts
+        content_parts = [fmt_prompt]
+        
+        # Process image nodes
+        successful_images = 0
+        for img_node in img_nodes:
+            image_part = self._process_image_node(img_node.node)
+            if image_part:
+                content_parts.append(img_node.get_content(metadata_mode=MetadataMode.LLM))
+                content_parts.append(image_part)
+                successful_images += 1
+        
+        print(f"Successfully processed {successful_images}/{len(img_nodes)} images")
+        
+        try:
+            # Generate content with structured output
+            response = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=content_parts,
+                config={
+                    "response_mime_type": "application/json",
+                    "response_schema": Structure,
                 }
+            )
+            structured_response = response.parsed
+            full_response = f"{structured_response.text_response}"
+        except Exception as e:
+            print(f"Structured output failed: {e}")
+            # Fallback to regular response
+            try:
+                response = client.models.generate_content(
+                    model="gemini-2.0-flash",
+                    contents=content_parts,
+                )
+                full_response = response.text
+                structured_response = None
+            except Exception as fallback_error:
+                print(f"Fallback failed: {fallback_error}")
+                full_response = f"Error: {str(e)}"
+                structured_response = None
+        
+        return Response(
+            response=full_response,
+            source_nodes=nodes,
+            metadata={
+                "text_nodes": text_nodes,
+                "image_nodes": img_nodes,
+                "successful_images": successful_images,
+                "total_images": len(img_nodes),
+                "structured_response": structured_response
+            }
+        )
+
+# Global index variable
+global_index = None
+
+# Initialize agent for legacy compatibility
+load_dotenv("./.env")
+api = os.getenv("GOOGLE_API_KEY")
+
+idp_agent = Agent(
+    name="IDP AGENT",
+    model=Gemini(id="gemini-2.0-flash", api_key=api),
+    tools=[PdfConversionTools()],
+    storage=SqliteStorage(table_name="agent_sessions", db_file="tmp/data.db", auto_upgrade_schema=True),
+    add_history_to_messages=True,
+    num_history_runs=2,
+    instructions=[
+        "You are an IDP Agent i.e. Intelligent Document Processing Agent. Working for InnuxAI",
+        "Use the PDF conversion tools to extract and analyze information from documents.",
+        "Handle page ranges or specific pages as specified by the user.",
+        "If rate limiting occurs, inform the user about partial results.",
+        "Always save the output to a file if specified, and return a confirmation message.",
+        "For queries, parse the PDF path, range/specific pages, and output file from the user input.",
+        "When analyzing documents, provide structured responses with clear reasoning."
+    ],
+    show_tool_calls=True,
+    markdown=True
+)
+
+# API Endpoints
+@app.get("/")
+async def root():
+    return {"message": "Multimodal Document Processing API", "status": "running"}
+
+@app.post("/reindex-documents")
+async def reindex_documents():
+    """Reindex all existing documents in the uploads folder"""
+    global global_index
+    
+    try:
+        # Initialize embeddings if not already done
+        if not initialize_embeddings():
+            raise HTTPException(status_code=500, detail="Failed to initialize embedding models")
+        
+        if not storage_context:
+            raise HTTPException(status_code=500, detail="Storage context not available")
+        
+        # Get all PDF files from uploads directory
+        if not os.path.exists(UPLOADS_DIR):
+            return {"message": "No uploads directory found", "processed": 0}
+        
+        pdf_files = [f for f in os.listdir(UPLOADS_DIR) if f.lower().endswith('.pdf')]
+        
+        if not pdf_files:
+            return {"message": "No PDF files found to reindex", "processed": 0}
+        
+        processed_docs = 0
+        all_documents = []
+        
+        for filename in pdf_files:
+            try:
+                file_path = os.path.join(UPLOADS_DIR, filename)
+                print(f"Reindexing: {filename}")
+                
+                # Extract images using new pipeline
+                extracted_files, doc_artifacts_dir = extract_images(file_path, method="both")
+                print(f"Extracted {len(extracted_files)} images for {filename}")
+                
+                # Load the original PDF document
+                pdf_documents = SimpleDirectoryReader(
+                    input_files=[file_path]
+                ).load_data()
+                
+                documents = pdf_documents.copy()
+                
+                # Load extracted images if they exist
+                if os.path.exists(doc_artifacts_dir):
+                    try:
+                        artifacts_documents = SimpleDirectoryReader(
+                            input_dir=doc_artifacts_dir,
+                            recursive=True
+                        ).load_data()
+                        documents.extend(artifacts_documents)
+                        print(f"Loaded {len(artifacts_documents)} image documents for {filename}")
+                    except Exception as e:
+                        print(f"Warning: Failed to load image documents for {filename}: {e}")
+                
+                all_documents.extend(documents)
+                processed_docs += 1
                 
             except Exception as e:
-                print(f"LLM generation failed: {e}")
-                pass
+                print(f"Error processing {filename}: {e}")
+                continue
         
-        # Fallback: return relevant document excerpts
+        if not all_documents:
+            return {"message": "No documents could be processed", "processed": 0}
+        
+        # Create new multimodal index with all documents
+        print(f"Creating multimodal index with {len(all_documents)} total documents...")
+        global_index = MultiModalVectorStoreIndex.from_documents(
+            all_documents,
+            storage_context=storage_context,
+            show_progress=True,
+        )
+        print("✅ Multimodal index created successfully")
+        
+        return {
+            "message": f"Successfully reindexed {processed_docs} PDF files",
+            "processed": processed_docs,
+            "total_documents": len(all_documents),
+            "status": "success"
+        }
+        
+    except Exception as e:
+        print(f"Reindexing error: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/debug-qdrant")
+async def debug_qdrant():
+    """Debug Qdrant connection and data"""
+    try:
+        if not storage_context:
+            return {"error": "Storage context not available"}
+        
+        client_instance = storage_context.vector_store._client
+        collections = client_instance.get_collections()
+        
+        result = {
+            "storage_context_available": storage_context is not None,
+            "client_available": client_instance is not None,
+            "collections_count": len(collections.collections),
+            "collections": []
+        }
+        
+        for col in collections.collections:
+            try:
+                info = client_instance.get_collection(col.name)
+                result["collections"].append({
+                    "name": col.name,
+                    "points": info.points_count,
+                    "vector_size": info.config.params.vectors.size if hasattr(info.config.params, 'vectors') else 'unknown'
+                })
+            except Exception as e:
+                result["collections"].append({
+                    "name": col.name,
+                    "error": str(e)
+                })
+        
+        return result
+    except Exception as e:
+        return {"error": str(e), "traceback": str(e.__traceback__)}
+
+@app.post("/restore-index")
+async def restore_index():
+    """Manually restore global index from existing Qdrant data"""
+    try:
+        if not initialize_embeddings():
+            raise HTTPException(status_code=500, detail="Failed to initialize embeddings")
+        
+        success = restore_global_index()
+        if success:
+            return {
+                "message": "Global index restored successfully",
+                "global_index_available": global_index is not None
+            }
+        else:
+            return {
+                "message": "Failed to restore global index - no existing data found",
+                "global_index_available": global_index is not None
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Index restoration failed: {str(e)}")
+
+@app.post("/initialize-system")
+async def initialize_system():
+    """Manually initialize embeddings and storage context"""
+    try:
+        success = initialize_embeddings()
+        if success:
+            return {
+                "message": "System initialized successfully",
+                "embeddings_initialized": embed_model_text is not None and embed_model_image is not None,
+                "storage_context_available": storage_context is not None
+            }
+        else:
+            return {
+                "message": "System initialization failed",
+                "embeddings_initialized": embed_model_text is not None and embed_model_image is not None,
+                "storage_context_available": storage_context is not None
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Initialization failed: {str(e)}")
+
+@app.get("/qdrant-status")
+async def qdrant_status():
+    """Check Qdrant database status and collections"""
+    try:
+        if not storage_context:
+            return {"error": "Storage context not initialized"}
+        
+        client_instance = storage_context.vector_store._client
+        collections = client_instance.get_collections()
+        
+        status = {
+            "database_path": "./qdrant_db",
+            "total_collections": len(collections.collections),
+            "collections": []
+        }
+        
+        for collection in collections.collections:
+            try:
+                collection_info = client_instance.get_collection(collection.name)
+                status["collections"].append({
+                    "name": collection.name,
+                    "points_count": collection_info.points_count,
+                    "vector_size": collection_info.config.params.vectors.size,
+                    "distance": collection_info.config.params.vectors.distance.value
+                })
+            except Exception as e:
+                status["collections"].append({
+                    "name": collection.name,
+                    "error": str(e)
+                })
+        
+        return status
+        
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/health")
+async def health_check():
+    try:
+        # Check if qdrant collections exist
+        qdrant_info = {}
+        if storage_context and storage_context.vector_store:
+            try:
+                client_instance = storage_context.vector_store._client
+                collections = client_instance.get_collections()
+                qdrant_info = {
+                    "collections": [col.name for col in collections.collections],
+                    "text_collection_exists": any(col.name == "text_collection" for col in collections.collections),
+                    "image_collection_exists": any(col.name == "image_collection" for col in collections.collections)
+                }
+                
+                # Get collection info if they exist
+                for collection_name in ["text_collection", "image_collection"]:
+                    try:
+                        collection_info = client_instance.get_collection(collection_name)
+                        qdrant_info[f"{collection_name}_points"] = collection_info.points_count
+                        qdrant_info[f"{collection_name}_vector_size"] = collection_info.config.params.vectors.size
+                    except Exception:
+                        qdrant_info[f"{collection_name}_points"] = 0
+                        
+            except Exception as e:
+                qdrant_info = {"error": str(e)}
+        
+        return {
+            "gemini_available": client is not None,
+            "embeddings_initialized": embed_model_text is not None and embed_model_image is not None,
+            "storage_context_available": storage_context is not None,
+            "global_index_available": global_index is not None,
+            "qdrant_info": qdrant_info
+        }
+    except Exception as e:
+        return {
+            "gemini_available": client is not None,
+            "embeddings_initialized": embed_model_text is not None and embed_model_image is not None,
+            "storage_context_available": storage_context is not None,
+            "global_index_available": global_index is not None,
+            "error": str(e)
+        }
+
+@app.post("/upload-document/")
+async def upload_document(file: UploadFile = File(...)):
+    """Upload and process document using new multimodal pipeline"""
+    global global_index
+    
+    try:
+        # Initialize embeddings if not already done
+        if not initialize_embeddings():
+            raise HTTPException(status_code=500, detail="Failed to initialize embedding models")
+        
+        if not storage_context:
+            raise HTTPException(status_code=500, detail="Storage context not available")
+        
+        # Read file content
+        file_bytes = await file.read()
+        file_hash = hashlib.md5(file_bytes).hexdigest()
+        doc_id = f"{file_hash[:8]}"
+        
+        # Save the original file
+        file_path = os.path.join(UPLOADS_DIR, f"{doc_id}_{file.filename}")
+        with open(file_path, "wb") as f:
+            f.write(file_bytes)
+        
+        if file.content_type == "application/pdf":
+            print(f"Processing PDF: {file.filename}")
+            
+            # Extract images using new pipeline
+            extracted_files, doc_artifacts_dir = extract_images(file_path, method="both")
+            print(f"Extracted {len(extracted_files)} images to {doc_artifacts_dir}")
+            
+            # Load the original PDF document
+            print("Loading PDF text content...")
+            pdf_documents = SimpleDirectoryReader(
+                input_files=[file_path]
+            ).load_data()
+            
+            documents = pdf_documents.copy()
+            
+            # Load extracted images if they exist
+            if os.path.exists(doc_artifacts_dir):
+                print("Loading extracted images...")
+                try:
+                    artifacts_documents = SimpleDirectoryReader(
+                        input_dir=doc_artifacts_dir,
+                        recursive=True
+                    ).load_data()
+                    documents.extend(artifacts_documents)
+                    print(f"Loaded {len(artifacts_documents)} image documents")
+                except Exception as e:
+                    print(f"Warning: Failed to load image documents: {e}")
+            
+            if not documents:
+                raise HTTPException(status_code=500, detail="No documents found to process")
+            
+            print(f"Total documents to index: {len(documents)}")
+            
+            # Create or update multimodal index
+            if global_index is None:
+                print("Creating new multimodal index...")
+                global_index = MultiModalVectorStoreIndex.from_documents(
+                    documents,
+                    storage_context=storage_context,
+                    show_progress=True,
+                )
+                print("✅ Multimodal index created")
+            else:
+                print("Adding documents to existing index...")
+                # Add new documents to existing index
+                for i, doc in enumerate(documents):
+                    print(f"Indexing document {i+1}/{len(documents)}")
+                    global_index.insert(doc)
+                print("✅ Documents added to existing index")
+            
+            return {
+                "message": "Document uploaded and processed successfully",
+                "doc_id": doc_id,
+                "extracted_images": len(extracted_files),
+                "total_documents": len(documents),
+                "status": "success"
+            }
+        else:
+            raise HTTPException(
+                status_code=415,
+                detail=f"Unsupported file type: {file.content_type}. Only PDF files are supported."
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/query-documents/")
+async def query_documents(request: QueryRequest):
+    """Query documents using new multimodal pipeline"""
+    global global_index
+    
+    try:
+        if not global_index:
+            raise HTTPException(status_code=400, detail="No documents uploaded yet. Please upload documents first.")
+        
+        if not client:
+            raise HTTPException(status_code=500, detail="Gemini client not available")
+        
+        # Ensure embeddings are initialized
+        if not initialize_embeddings():
+            raise HTTPException(status_code=500, detail="Failed to initialize embedding models")
+        
+        # Create retriever
+        retriever = global_index.as_retriever(
+            similarity_top_k=request.top_k * 7,  # Get more text nodes
+            image_similarity_top_k=request.top_k * 2  # Increased to get more image diversity
+        )
+        
+        # Create multimodal engine
+        engine = MultimodalGeminiEngine(retriever=retriever)
+        
+        # Execute query
+        response = engine.custom_query(request.query)
+        
+        # Extract source information including images
+        sources = []
+        image_sources = []
+        
+        for node in response.source_nodes:
+            if isinstance(node.node, ImageNode):
+                image_info = {
+                    "type": "image",
+                    "content": node.get_content(metadata_mode=MetadataMode.LLM)[:200] + "..." if len(node.get_content(metadata_mode=MetadataMode.LLM)) > 200 else node.get_content(metadata_mode=MetadataMode.LLM),
+                    "metadata": node.node.metadata if hasattr(node.node, 'metadata') else {},
+                }
+                
+                # Add image path if available for frontend rendering
+                if hasattr(node.node, 'image_path'):
+                    image_info["image_path"] = node.node.image_path
+                    image_info["filename"] = os.path.basename(node.node.image_path)
+                
+                image_sources.append(image_info)
+            else:
+                sources.append({
+                    "type": "text",
+                    "content": node.get_content(metadata_mode=MetadataMode.LLM)[:300] + "..." if len(node.get_content(metadata_mode=MetadataMode.LLM)) > 300 else node.get_content(metadata_mode=MetadataMode.LLM),
+                    "metadata": node.node.metadata if hasattr(node.node, 'metadata') else {},
+                })
+        
         return {
             "query": request.query,
-            "answer": "Here are the most relevant document excerpts:",
-            "sources": [
-                {
-                    "document_index": i + 1,
-                    "content": doc[:500] + "..." if len(doc) > 500 else doc
-                }
-                for i, doc in enumerate(documents)
-            ],
-            "method": "document_retrieval"
+            "answer": response.response,
+            "sources": sources,
+            "image_sources": image_sources,
+            "metadata": response.metadata,
+            "method": "multimodal_rag"
         }
         
     except HTTPException:
@@ -495,67 +888,191 @@ async def query_documents(request: QueryRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/query-documents-stream")
+async def query_documents_stream(request: StreamQueryRequest):
+    """Stream multimodal query responses"""
+    global global_index
+    
+    async def generate_stream():
+        try:
+            if not global_index:
+                yield f"data: {json.dumps({'type': 'error', 'content': 'No documents uploaded yet'})}\n\n"
+                return
+            
+            # Initialize embeddings if needed
+            if not initialize_embeddings():
+                yield f"data: {json.dumps({'type': 'error', 'content': 'Failed to initialize embedding models'})}\n\n"
+                return
+            
+            yield f"data: {json.dumps({'type': 'status', 'content': 'Searching documents...'})}\n\n"
+            
+            # Create retriever with exact values from PDF
+            retriever = global_index.as_retriever(
+                similarity_top_k=70,  # Exact value from PDF
+                image_similarity_top_k=10  # Exact value from PDF
+            )
+            
+            # Create multimodal engine
+            engine = MultimodalGeminiEngine(retriever=retriever)
+            
+            yield f"data: {json.dumps({'type': 'status', 'content': 'Processing multimodal content...'})}\n\n"
+            
+            # Execute query
+            response = engine.custom_query(request.query)
+            
+            # Send sources first
+            sources = []
+            image_sources = []
+            
+            # Get file names used from metadata (this is the manually tracked list)
+            files_used_in_response = []
+            if hasattr(response, 'metadata') and response.metadata:
+                # First try structured response with correct field name
+                structured_response = response.metadata.get('structured_response')
+                if structured_response and hasattr(structured_response, 'file_name_used'):
+                    files_used_in_response = structured_response.file_name_used
+                else:
+                    # Fallback to manually tracked image_files_used
+                    files_used_in_response = response.metadata.get('image_files_used', [])
+            
+            for node in response.source_nodes:
+                if isinstance(node.node, ImageNode):
+                    image_info = {
+                        "type": "image",
+                        "content": node.get_content(metadata_mode=MetadataMode.LLM)[:200] + "...",
+                        "metadata": node.node.metadata if hasattr(node.node, 'metadata') else {},
+                    }
+                    if hasattr(node.node, 'image_path'):
+                        image_info["image_path"] = node.node.image_path
+                        image_info["filename"] = os.path.basename(node.node.image_path)
+                        # Mark if this image was used in the response
+                        if image_info["filename"] in files_used_in_response:
+                            image_info["used_in_response"] = True
+                    image_sources.append(image_info)
+                else:
+                    sources.append({
+                        "type": "text", 
+                        "content": node.get_content(metadata_mode=MetadataMode.LLM)[:300] + "...",
+                        "metadata": node.node.metadata if hasattr(node.node, 'metadata') else {},
+                    })
+            
+            # Add images used in response to sources if not already included
+            for filename in files_used_in_response:
+                # Check if this filename is already in image_sources
+                already_included = any(img.get("filename") == filename for img in image_sources)
+                if not already_included:
+                    # Try to find the full path for this filename
+                    for node in response.source_nodes:
+                        if isinstance(node.node, ImageNode) and hasattr(node.node, 'image_path'):
+                            if os.path.basename(node.node.image_path) == filename:
+                                image_sources.append({
+                                    "type": "image",
+                                    "content": f"Image used in response: {filename}",
+                                    "metadata": node.node.metadata if hasattr(node.node, 'metadata') else {},
+                                    "image_path": node.node.image_path,
+                                    "filename": filename,
+                                    "used_in_response": True
+                                })
+                                break
+            
+            yield f"data: {json.dumps({'type': 'sources', 'content': {'text_sources': sources, 'image_sources': image_sources, 'files_used_in_response': files_used_in_response}})}\n\n"
+            
+            # Stream the response
+            yield f"data: {json.dumps({'type': 'response', 'content': response.response})}\n\n"
+            yield f"data: {json.dumps({'type': 'complete', 'content': 'Response completed'})}\n\n"
+            
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'content': f'Error: {str(e)}'})}\n\n"
+    
+    return StreamingResponse(
+        generate_stream(),
+        media_type="text/plain",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive", 
+            "Content-Type": "text/event-stream",
+        }
+    )
+
+@app.get("/get-image/{image_path:path}")
+async def get_image(image_path: str):
+    """Serve extracted images for frontend rendering"""
+    try:
+        # Construct full path
+        full_path = os.path.join(ARTIFACTS_DIR, image_path)
+        
+        if not os.path.exists(full_path):
+            raise HTTPException(status_code=404, detail="Image not found")
+        
+        # Determine media type
+        ext = os.path.splitext(full_path)[1].lower()
+        media_type_map = {
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.png': 'image/png',
+            '.gif': 'image/gif',
+            '.bmp': 'image/bmp',
+            '.webp': 'image/webp'
+        }
+        media_type = media_type_map.get(ext, 'image/jpeg')
+        
+        return FileResponse(
+            path=full_path,
+            media_type=media_type,
+            filename=os.path.basename(full_path)
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/list-documents/")
 async def list_documents():
     """List all uploaded documents"""
     try:
-        if not collection:
-            raise HTTPException(status_code=500, detail="ChromaDB not available")
+        uploaded_files = []
         
-        # Get all documents
-        all_docs = collection.get(include=['metadatas'])
-        
-        documents = [
-            {
-                "doc_id": doc_id,
-                "filename": metadata.get('filename', 'Unknown'),
-                "content_type": metadata.get('content_type', 'Unknown'),
-                "extraction_method": metadata.get('extraction_method', 'Unknown'),
-                "file_size": metadata.get('file_size', 0)
-            }
-            for doc_id, metadata in zip(all_docs['ids'], all_docs['metadatas'])
-        ]
+        if os.path.exists(UPLOADS_DIR):
+            for filename in os.listdir(UPLOADS_DIR):
+                filepath = os.path.join(UPLOADS_DIR, filename)
+                if os.path.isfile(filepath):
+                    file_stats = os.stat(filepath)
+                    
+                    # Determine content type from file extension
+                    content_type = "application/pdf" if filename.lower().endswith('.pdf') else "application/msword"
+                    
+                    uploaded_files.append({
+                        "filename": filename,
+                        "content_type": content_type,
+                        "file_size": file_stats.st_size,
+                        "created_at": file_stats.st_mtime
+                    })
         
         return {
-            "total_documents": len(documents),
-            "documents": documents
+            "total_documents": len(uploaded_files),
+            "documents": uploaded_files
         }
         
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/view-document/{doc_id}")
-async def view_document(doc_id: str):
+@app.get("/view-document/{filename}")
+async def view_document(filename: str):
     """Get the original document file for viewing"""
     try:
-        if not collection:
-            raise HTTPException(status_code=500, detail="ChromaDB not available")
+        file_path = os.path.join(UPLOADS_DIR, filename)
         
-        # Get document metadata
-        result = collection.get(ids=[doc_id], include=["metadatas"])
-        
-        if not result['ids']:
+        if not os.path.exists(file_path):
             raise HTTPException(status_code=404, detail="Document not found")
         
-        metadata = result['metadatas'][0]
-        file_path = metadata.get('file_path')
-        
-        if not file_path or not os.path.exists(file_path):
-            raise HTTPException(status_code=404, detail="Original file not found")
-        
-        # Create response with inline disposition for PDFs
+        # For PDFs, set Content-Disposition to inline to display in browser
         response = FileResponse(
             path=file_path,
-            media_type=metadata['content_type'],
-            filename=metadata['filename']
+            media_type="application/pdf",
+            filename=filename
         )
-        
-        # For PDFs, set Content-Disposition to inline to display in browser
-        if metadata['content_type'] == 'application/pdf':
-            response.headers["Content-Disposition"] = f'inline; filename="{metadata["filename"]}"'
+        response.headers["Content-Disposition"] = f'inline; filename="{filename}"'
         
         return response
         
@@ -564,37 +1081,60 @@ async def view_document(doc_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.delete("/delete-document/{doc_id}")
-async def delete_document(doc_id: str):
-    """Delete a specific document"""
+@app.delete("/delete-document/{filename}")
+async def delete_document(filename: str):
+    """Delete a specific document and its artifacts"""
     try:
-        if not collection:
-            raise HTTPException(status_code=500, detail="ChromaDB not available")
+        file_path = os.path.join(UPLOADS_DIR, filename)
         
-        # Get document metadata to find file path
-        try:
-            result = collection.get(ids=[doc_id], include=["metadatas"])
-            if result['ids'] and result['metadatas']:
-                metadata = result['metadatas'][0]
-                file_path = metadata.get('file_path')
-                
-                # Delete the physical file if it exists
-                if file_path and os.path.exists(file_path):
-                    os.remove(file_path)
-        except:
-            pass  # Continue with deletion even if file removal fails
+        if os.path.exists(file_path):
+            os.remove(file_path)
         
-        # Delete from vector database
-        collection.delete(ids=[doc_id])
+        # Also remove associated artifacts
+        doc_name = os.path.splitext(filename)[0]
+        artifacts_path = os.path.join(ARTIFACTS_DIR, doc_name)
+        
+        if os.path.exists(artifacts_path):
+            import shutil
+            shutil.rmtree(artifacts_path)
         
         return {
-            "message": f"Document {doc_id} deleted successfully",
+            "message": f"Document {filename} and its artifacts deleted successfully",
             "status": "success"
         }
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# Legacy endpoint for backward compatibility
+@app.post("/query-documents1/")
+async def query_documents_legacy(request: QueryRequest):
+    """Legacy query endpoint using IDP agent"""
+    global idp_agent
+    
+    try:
+        # Use IDP agent to process query
+        response = await idp_agent.arun(f"Query: {request.query}")
+        
+        # Extract only serializable content from agent response
+        if hasattr(response, 'content') and response.content:
+            answer = response.content
+        elif isinstance(response, str):
+            answer = response
+        else:
+            answer = str(response)
+        
+        return {
+            "query": request.query,
+            "answer": answer,
+            "sources": [],
+            "method": "legacy_agent"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 if __name__ == "__main__":
-    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

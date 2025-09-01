@@ -11,3 +11,12 @@ sentence-transformers
 google-genai
 python-docx
 langchain
+llama-index
+llama-index-vector-stores-qdrant
+llama-index-embeddings-huggingface
+PyMuPDF
+qdrant-client
+scikit-image
+matplotlib
+torch
+torchvision
