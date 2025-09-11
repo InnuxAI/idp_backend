@@ -37,7 +37,12 @@ from tools.pdfConversionTools import PdfConversionTools
 from agno.playground import Playground, serve_playground_app
 from agno.storage.sqlite import SqliteStorage
 
-load_dotenv("../../.env")
+load_dotenv()  # Load from current directory first
+load_dotenv("../../.env")  # Then load from parent for additional keys
+
+# Set up environment variables for backward compatibility
+if not os.getenv("GEMINI_API_KEY") and os.getenv("GOOGLE_API_KEY"):
+    os.environ["GEMINI_API_KEY"] = os.getenv("GOOGLE_API_KEY")
 
 # Create uploads directory if it doesn't exist
 UPLOADS_DIR = "./uploads"
@@ -54,6 +59,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Import and include schema routes
+from routes.schemas import router as schema_router
+from routes.extraction import router as extraction_router
+app.include_router(schema_router, prefix="/api")
+app.include_router(extraction_router, prefix="/api")
 
 # Initialize Gemini client
 try:
@@ -1105,6 +1116,188 @@ async def delete_document(filename: str):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/validate-file")
+async def validate_file(file: UploadFile = File(...)):
+    """
+    Validate uploaded file for size and page count limits
+    """
+    try:
+        # Check file size (5MB limit)
+        MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB in bytes
+        file_content = await file.read()
+        file_size = len(file_content)
+        
+        if file_size > MAX_FILE_SIZE:
+            return {
+                "valid": False,
+                "error": "file_size",
+                "message": f"File size ({file_size / 1024 / 1024:.1f}MB) exceeds the 5MB limit",
+                "file_size_mb": round(file_size / 1024 / 1024, 1),
+                "max_size_mb": 5
+            }
+        
+        # Check if it's a PDF and count pages
+        if file.content_type == "application/pdf" or file.filename.lower().endswith('.pdf'):
+            try:
+                import io
+                import fitz  # PyMuPDF
+                
+                # Create a file-like object from the content
+                pdf_stream = io.BytesIO(file_content)
+                pdf_document = fitz.open(stream=pdf_stream, filetype="pdf")
+                page_count = pdf_document.page_count
+                pdf_document.close()
+                
+                MAX_PAGES = 100
+                if page_count > MAX_PAGES:
+                    return {
+                        "valid": False,
+                        "error": "page_count",
+                        "message": f"PDF has {page_count} pages, which exceeds the {MAX_PAGES} page limit",
+                        "page_count": page_count,
+                        "max_pages": MAX_PAGES
+                    }
+                
+                return {
+                    "valid": True,
+                    "message": "File validation successful",
+                    "file_size_mb": round(file_size / 1024 / 1024, 1),
+                    "page_count": page_count
+                }
+                
+            except Exception as e:
+                return {
+                    "valid": False,
+                    "error": "pdf_processing",
+                    "message": f"Error processing PDF: {str(e)}"
+                }
+        else:
+            # For non-PDF files, just check size
+            return {
+                "valid": True,
+                "message": "File validation successful",
+                "file_size_mb": round(file_size / 1024 / 1024, 1),
+                "page_count": None
+            }
+            
+    except Exception as e:
+        return {
+            "valid": False,
+            "error": "validation_error",
+            "message": f"File validation error: {str(e)}"
+        }
+
+@app.get("/dashboard/metrics")
+async def get_dashboard_metrics():
+    """
+    Get dashboard metrics including document counts, processing stats, and daily metrics
+    """
+    try:
+        from db.sqlite_db import db
+        from datetime import datetime, date
+        import os
+        
+        # Get document types count by file extension
+        doc_type_counts = {}
+        upload_files = os.listdir(UPLOADS_DIR) if os.path.exists(UPLOADS_DIR) else []
+        
+        for filename in upload_files:
+            if filename.startswith('.'):  # Skip hidden files
+                continue
+            ext = os.path.splitext(filename)[1].lower()
+            if ext == '.pdf':
+                doc_type_counts['PDF'] = doc_type_counts.get('PDF', 0) + 1
+            elif ext in ['.doc', '.docx']:
+                doc_type_counts['Word'] = doc_type_counts.get('Word', 0) + 1
+            elif ext in ['.txt']:
+                doc_type_counts['Text'] = doc_type_counts.get('Text', 0) + 1
+            elif ext in ['.jpg', '.jpeg', '.png', '.gif']:
+                doc_type_counts['Image'] = doc_type_counts.get('Image', 0) + 1
+            else:
+                doc_type_counts['Other'] = doc_type_counts.get('Other', 0) + 1
+        
+        # Get today's date
+        today = date.today().isoformat()
+        
+        # Get extraction stats for today
+        extractions = db.get_extractions()
+        today_extractions = [e for e in extractions if e['created_at'].startswith(today)]
+        today_count = len(today_extractions)
+        today_success = len([e for e in today_extractions if e.get('is_approved', False)])
+        today_failed = today_count - today_success
+        
+        # Get total document count
+        total_docs = len(upload_files)
+        
+        # Get total schema count
+        schemas = db.get_schemas()
+        total_schemas = len(schemas)
+        
+        # Get processing stats for the last 30 days for chart
+        from collections import defaultdict
+        from datetime import datetime, timedelta
+        
+        daily_stats = defaultdict(lambda: {'processed': 0, 'successful': 0, 'failed': 0})
+        
+        # Calculate stats for last 30 days
+        end_date = datetime.now().date()
+        start_date = end_date - timedelta(days=29)
+        
+        for extraction in extractions:
+            try:
+                extraction_date = datetime.fromisoformat(extraction['created_at'].replace('Z', '+00:00')).date()
+                if start_date <= extraction_date <= end_date:
+                    date_str = extraction_date.isoformat()
+                    daily_stats[date_str]['processed'] += 1
+                    if extraction.get('is_approved', False):
+                        daily_stats[date_str]['successful'] += 1
+                    else:
+                        daily_stats[date_str]['failed'] += 1
+            except Exception as e:
+                print(f"Error parsing date {extraction.get('created_at')}: {e}")
+                continue
+        
+        # Fill in missing dates with zeros
+        current_date = start_date
+        chart_data = []
+        while current_date <= end_date:
+            date_str = current_date.isoformat()
+            stats = daily_stats[date_str]
+            chart_data.append({
+                'date': date_str,
+                'processed': stats['processed'],
+                'successful': stats['successful'],
+                'failed': stats['failed']
+            })
+            current_date += timedelta(days=1)
+        
+        return {
+            'doc_type_counts': doc_type_counts,
+            'today_stats': {
+                'total': today_count,
+                'successful': today_success,
+                'failed': today_failed
+            },
+            'overview_stats': {
+                'total_documents': total_docs,
+                'total_schemas': total_schemas,
+                'total_extractions': len(extractions),
+                'success_rate': round((sum([1 for e in extractions if e.get('is_approved', False)]) / max(len(extractions), 1)) * 100, 1)
+            },
+            'chart_data': chart_data
+        }
+        
+    except Exception as e:
+        print(f"Error getting dashboard metrics: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            'doc_type_counts': {},
+            'today_stats': {'total': 0, 'successful': 0, 'failed': 0},
+            'overview_stats': {'total_documents': 0, 'total_schemas': 0, 'total_extractions': 0, 'success_rate': 0},
+            'chart_data': []
+        }
 
 # Legacy endpoint for backward compatibility
 @app.post("/query-documents1/")

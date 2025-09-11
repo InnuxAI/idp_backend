@@ -11,6 +11,7 @@ sentence-transformers
 google-genai
 python-docx
 langchain
+langchain-google-genai
 llama-index
 llama-index-vector-stores-qdrant
 llama-index-embeddings-huggingface
