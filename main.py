@@ -63,8 +63,10 @@ app.add_middleware(
 # Import and include schema routes
 from routes.schemas import router as schema_router
 from routes.extraction import router as extraction_router
+from routes.two_way_match import router as two_way_match_router
 app.include_router(schema_router, prefix="/api")
 app.include_router(extraction_router, prefix="/api")
+app.include_router(two_way_match_router, prefix="/api")
 
 # Initialize Gemini client
 try:
@@ -480,7 +482,7 @@ api = os.getenv("GOOGLE_API_KEY")
 idp_agent = Agent(
     name="IDP AGENT",
     model=Gemini(id="gemini-2.0-flash", api_key=api),
-    tools=[PdfConversionTools()],
+    tools=[],
     storage=SqliteStorage(table_name="agent_sessions", db_file="tmp/data.db", auto_upgrade_schema=True),
     add_history_to_messages=True,
     num_history_runs=2,
@@ -492,6 +494,27 @@ idp_agent = Agent(
         "Always save the output to a file if specified, and return a confirmation message.",
         "For queries, parse the PDF path, range/specific pages, and output file from the user input.",
         "When analyzing documents, provide structured responses with clear reasoning."
+    ],
+    show_tool_calls=True,
+    markdown=True
+)
+
+two_way_match_agent = Agent(
+    name="Two Way Match Agent",
+    model=Gemini(id="gemini-2.0-flash", api_key=api),
+    tools=[],
+    storage=SqliteStorage(table_name="agent_sessions", db_file="tmp/data.db", auto_upgrade_schema=True),
+    add_history_to_messages=True,
+    num_history_runs=2,
+    instructions=[
+        "You are a Two Way Match Agent. Working for InnuxAI",
+        "You will be given 2 json files. One is the PO (Purchase Order) and the other is the INV (Invoice)",
+        "Your task is to match each line item in the INV to the corresponding line item in the PO",
+        "If for an item in INV you cannot find a match in the PO, you should mark it as 'No Match Found'",
+        "As the line items name will not be an exact match, use your reasoning to find the best match with your confidence score.",
+        "return a json array with the following fields: item in INV, matched item in PO, confidence score (0-100), reasoning",
+        "When analyzing, provide structured responses with clear reasoning.",
+        "If rate limiting occurs, inform the user about it.",
     ],
     show_tool_calls=True,
     markdown=True
@@ -1141,7 +1164,7 @@ async def validate_file(file: UploadFile = File(...)):
         if file.content_type == "application/pdf" or file.filename.lower().endswith('.pdf'):
             try:
                 import io
-                import fitz  # PyMuPDF
+                import pymupdf as fitz  # PyMuPDF
                 
                 # Create a file-like object from the content
                 pdf_stream = io.BytesIO(file_content)
