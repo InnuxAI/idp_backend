@@ -11,6 +11,9 @@ import uuid
 import io
 import hashlib
 import traceback
+import tempfile
+import time
+import threading
 from dotenv import load_dotenv
 import uvicorn
 
@@ -49,8 +52,40 @@ if not os.getenv("GEMINI_API_KEY") and os.getenv("GOOGLE_API_KEY"):
 # Create uploads directory if it doesn't exist
 UPLOADS_DIR = "./uploads"
 ARTIFACTS_DIR = "./artifacts"
+TEMP_SOURCES_DIR = "./temp_sources"
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 os.makedirs(ARTIFACTS_DIR, exist_ok=True)
+os.makedirs(TEMP_SOURCES_DIR, exist_ok=True)
+
+# Temporary file cleanup settings
+TEMP_FILE_EXPIRY_SECONDS = 300  # 5 minutes
+temp_files_registry = {}  # {file_id: {'path': str, 'created_at': float}}
+
+def cleanup_expired_temp_files():
+    """Clean up expired temporary files"""
+    current_time = time.time()
+    expired_files = []
+    
+    for file_id, file_info in temp_files_registry.items():
+        if current_time - file_info['created_at'] > TEMP_FILE_EXPIRY_SECONDS:
+            try:
+                if os.path.exists(file_info['path']):
+                    os.remove(file_info['path'])
+                expired_files.append(file_id)
+            except Exception as e:
+                print(f"Error removing temp file {file_info['path']}: {e}")
+    
+    # Remove expired entries from registry
+    for file_id in expired_files:
+        del temp_files_registry[file_id]
+
+def start_cleanup_timer():
+    """Start periodic cleanup of temporary files"""
+    cleanup_expired_temp_files()
+    # Schedule next cleanup
+    timer = threading.Timer(60.0, start_cleanup_timer)  # Check every minute
+    timer.daemon = True
+    timer.start()
 
 app = FastAPI(title="Multimodal Document Processing API")
 
@@ -78,6 +113,8 @@ async def startup_event():
     """Initialize connections on startup"""
     try:
         await connect_to_mongo()
+        # Start temp file cleanup timer
+        start_cleanup_timer()
         print("✅ Application startup completed")
     except Exception as e:
         print(f"❌ Startup failed: {e}")
@@ -1028,7 +1065,29 @@ async def query_documents_stream(request: StreamQueryRequest):
                                 })
                                 break
             
-            yield f"data: {json.dumps({'type': 'sources', 'content': {'text_sources': sources, 'image_sources': image_sources, 'files_used_in_response': files_used_in_response}})}\n\n"
+            # Create temporary file for sources instead of sending in stream
+            sources_data = {
+                'text_sources': sources, 
+                'image_sources': image_sources, 
+                'files_used_in_response': files_used_in_response
+            }
+            
+            # Generate unique file ID
+            file_id = str(uuid.uuid4())
+            temp_file_path = os.path.join(TEMP_SOURCES_DIR, f"sources_{file_id}.json")
+            
+            # Save sources to temporary file
+            with open(temp_file_path, 'w', encoding='utf-8') as f:
+                json.dump(sources_data, f, ensure_ascii=False, indent=2)
+            
+            # Register file in cleanup registry
+            temp_files_registry[file_id] = {
+                'path': temp_file_path,
+                'created_at': time.time()
+            }
+            
+            # Send file URL instead of sources data
+            yield f"data: {json.dumps({'type': 'sources_file', 'content': {'file_id': file_id, 'url': f'/get-temp-sources/{file_id}'}})}\n\n"
             
             # Stream the response
             yield f"data: {json.dumps({'type': 'response', 'content': response.response})}\n\n"
@@ -1073,6 +1132,44 @@ async def get_image(image_path: str):
             path=full_path,
             media_type=media_type,
             filename=os.path.basename(full_path)
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/get-temp-sources/{file_id}")
+async def get_temp_sources(file_id: str):
+    """Serve temporary source files"""
+    try:
+        # Check if file exists in registry
+        if file_id not in temp_files_registry:
+            raise HTTPException(status_code=404, detail="Temporary file not found or expired")
+        
+        file_info = temp_files_registry[file_id]
+        file_path = file_info['path']
+        
+        # Check if file still exists on disk
+        if not os.path.exists(file_path):
+            # Clean up registry entry
+            del temp_files_registry[file_id]
+            raise HTTPException(status_code=404, detail="Temporary file not found")
+        
+        # Check if file has expired
+        if time.time() - file_info['created_at'] > TEMP_FILE_EXPIRY_SECONDS:
+            # Clean up expired file
+            try:
+                os.remove(file_path)
+                del temp_files_registry[file_id]
+            except Exception:
+                pass
+            raise HTTPException(status_code=404, detail="Temporary file expired")
+        
+        return FileResponse(
+            path=file_path,
+            media_type="application/json",
+            filename=f"sources_{file_id}.json"
         )
         
     except HTTPException:
