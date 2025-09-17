@@ -3,6 +3,7 @@ from typing import Optional, Dict, Any
 from bson import ObjectId
 from fastapi import HTTPException, status
 from pymongo.errors import DuplicateKeyError
+import os
 
 from db.mongodb import get_database
 from models.auth_models import (
@@ -273,7 +274,7 @@ class AuthService:
         await db.password_reset_tokens.insert_one(reset_record)
         
         # Send reset email
-        reset_link = f"http://localhost:3000/reset-password?token={reset_token}"
+        reset_link = f"{os.getenv('NEXT_PUBLIC_FRONTEND_URL', 'http://localhost:3000')}/reset-password?token={reset_token}"
         email_sent = await email_service.send_password_reset_email(forgot_data.email, reset_link)
         
         if not email_sent:
