@@ -37,8 +37,6 @@ from google import genai
 from google.genai import types
 from agno.agent import Agent
 from agno.models.google import Gemini
-from tools.pdfConversionTools import PdfConversionTools 
-from agno.playground import Playground, serve_playground_app
 from agno.storage.sqlite import SqliteStorage
 from db.mongodb import connect_to_mongo, close_mongo_connection
 
