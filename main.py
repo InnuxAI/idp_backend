@@ -959,8 +959,8 @@ async def query_documents_stream(request: StreamQueryRequest):
             
             # Create retriever with exact values from PDF
             retriever = global_index.as_retriever(
-                similarity_top_k=70,  # Exact value from PDF
-                image_similarity_top_k=10  # Exact value from PDF
+                similarity_top_k=os.getenv("TEXT_K", 30),  # Exact value from PDF
+                image_similarity_top_k=os.getenv("IMAGE_K", 10)  # Exact value from PDF
             )
             
             # Create multimodal engine
