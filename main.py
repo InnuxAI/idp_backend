@@ -14,8 +14,12 @@ import traceback
 from dotenv import load_dotenv
 import uvicorn
 
-# New pipeline imports
-import pymupdf as fitz  # PyMuPDF
+try:
+    import pymupdf as fitz  # PyMuPDF
+except ImportError:
+    print("pymupdf not found, using fitz directly.")
+    import fitz
+
 from PIL import Image
 import qdrant_client
 from llama_index.vector_stores.qdrant import QdrantVectorStore
@@ -36,6 +40,7 @@ from agno.models.google import Gemini
 from tools.pdfConversionTools import PdfConversionTools 
 from agno.playground import Playground, serve_playground_app
 from agno.storage.sqlite import SqliteStorage
+from db.mongodb import connect_to_mongo, close_mongo_connection
 
 load_dotenv()  # Load from current directory first
 load_dotenv("../../.env")  # Then load from parent for additional keys
@@ -64,9 +69,30 @@ app.add_middleware(
 from routes.schemas import router as schema_router
 from routes.extraction import router as extraction_router
 from routes.two_way_match import router as two_way_match_router
+from routes.auth import router as auth_router
 app.include_router(schema_router, prefix="/api")
 app.include_router(extraction_router, prefix="/api")
 app.include_router(two_way_match_router, prefix="/api")
+app.include_router(auth_router, prefix="/api/v1")
+
+# Startup and shutdown events
+@app.on_event("startup")
+async def startup_event():
+    """Initialize connections on startup"""
+    try:
+        await connect_to_mongo()
+        print("✅ Application startup completed")
+    except Exception as e:
+        print(f"❌ Startup failed: {e}")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Close connections on shutdown"""
+    try:
+        await close_mongo_connection()
+        print("✅ Application shutdown completed")
+    except Exception as e:
+        print(f"❌ Shutdown error: {e}")
 
 # Initialize Gemini client
 try:
@@ -1164,7 +1190,7 @@ async def validate_file(file: UploadFile = File(...)):
         if file.content_type == "application/pdf" or file.filename.lower().endswith('.pdf'):
             try:
                 import io
-                import pymupdf as fitz  # PyMuPDF
+                import   fitz  # PyMuPDF
                 
                 # Create a file-like object from the content
                 pdf_stream = io.BytesIO(file_content)

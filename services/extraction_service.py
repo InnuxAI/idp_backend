@@ -2,11 +2,16 @@ import json
 import os
 import time
 from typing import Dict, Any, List, Optional
-import pymupdf as fitz
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.schema import HumanMessage
 from db.sqlite_db import db
 import traceback
+
+try:
+    import pymupdf as fitz  # PyMuPDF
+except ImportError:
+    print("pymupdf not found, using fitz directly.")
+    import fitz
 
 class ExtractionService:
     def __init__(self):

@@ -21,3 +21,11 @@ scikit-image
 matplotlib
 torch
 torchvision
+pymongo
+motor
+bcrypt
+pyjwt
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
+email-validator
