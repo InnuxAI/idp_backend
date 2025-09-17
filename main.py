@@ -506,8 +506,6 @@ idp_agent = Agent(
     name="IDP AGENT",
     model=Gemini(id="gemini-2.0-flash", api_key=api),
     tools=[],
-    add_history_to_messages=True,
-    num_history_runs=2,
     instructions=[
         "You are an IDP Agent i.e. Intelligent Document Processing Agent. Working for InnuxAI",
         "Use the PDF conversion tools to extract and analyze information from documents.",
@@ -525,8 +523,6 @@ two_way_match_agent = Agent(
     name="Two Way Match Agent",
     model=Gemini(id="gemini-2.0-flash", api_key=api),
     tools=[],
-    add_history_to_messages=True,
-    num_history_runs=2,
     instructions=[
         "You are a Two Way Match Agent. Working for InnuxAI",
         "You will be given 2 json files. One is the PO (Purchase Order) and the other is the INV (Invoice)",
