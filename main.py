@@ -37,7 +37,6 @@ from google import genai
 from google.genai import types
 from agno.agent import Agent
 from agno.models.google import Gemini
-from agno.storage.sqlite import SqliteStorage
 from db.mongodb import connect_to_mongo, close_mongo_connection
 
 load_dotenv()  # Load from current directory first
@@ -507,7 +506,6 @@ idp_agent = Agent(
     name="IDP AGENT",
     model=Gemini(id="gemini-2.0-flash", api_key=api),
     tools=[],
-    storage=SqliteStorage(table_name="agent_sessions", db_file="tmp/data.db", auto_upgrade_schema=True),
     add_history_to_messages=True,
     num_history_runs=2,
     instructions=[
@@ -527,7 +525,6 @@ two_way_match_agent = Agent(
     name="Two Way Match Agent",
     model=Gemini(id="gemini-2.0-flash", api_key=api),
     tools=[],
-    storage=SqliteStorage(table_name="agent_sessions", db_file="tmp/data.db", auto_upgrade_schema=True),
     add_history_to_messages=True,
     num_history_runs=2,
     instructions=[
