@@ -7,7 +7,7 @@ import os
 from typing import List, Optional, Iterator
 import asyncio
 import json
-import uuid
+import uuid 
 import io
 import hashlib
 import traceback
@@ -948,19 +948,21 @@ async def query_documents_stream(request: StreamQueryRequest):
         try:
             if not global_index:
                 yield f"data: {json.dumps({'type': 'error', 'content': 'No documents uploaded yet'})}\n\n"
+                print("NO GLOBAL INDEX")
                 return
             
-            # Initialize embeddings if needed
-            if not initialize_embeddings():
-                yield f"data: {json.dumps({'type': 'error', 'content': 'Failed to initialize embedding models'})}\n\n"
-                return
+            # # Initialize embeddings if needed
+            # if not initialize_embeddings():
+
+            #     yield f"data: {json.dumps({'type': 'error', 'content': 'Failed to initialize embedding models'})}\n\n"
+            #     return
             
             yield f"data: {json.dumps({'type': 'status', 'content': 'Searching documents...'})}\n\n"
             
             # Create retriever with exact values from PDF
             retriever = global_index.as_retriever(
-                similarity_top_k=os.getenv("TEXT_K", 30),  # Exact value from PDF
-                image_similarity_top_k=os.getenv("IMAGE_K", 10)  # Exact value from PDF
+                similarity_top_k=30,  # Exact value from PDF
+                image_similarity_top_k=10  # Exact value from PDF
             )
             
             # Create multimodal engine
