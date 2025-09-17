@@ -35,7 +35,7 @@ from llama_index.core.base.response.schema import Response
 # Original imports for agent functionality
 from google import genai
 from google.genai import types
-from agno.agent import Agent, RunResponseEvent
+from agno.agent import Agent
 from agno.models.google import Gemini
 from tools.pdfConversionTools import PdfConversionTools 
 from agno.playground import Playground, serve_playground_app
